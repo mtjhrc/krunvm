@@ -2,18 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::Args;
-use libc::c_char;
+use libc::{c_char, c_int};
+use nix::errno::Errno;
+use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
+use nix::unistd::unlink;
+use rand::distributions::{Alphanumeric, DistString};
+use std::collections::HashMap;
 use std::ffi::CString;
+
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::{Error, ErrorKind};
+
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
+
 #[cfg(target_os = "macos")]
 use std::path::Path;
+use std::process::Stdio;
+
+use std::thread;
+use std::time::Duration;
 
 use crate::bindings;
+use crate::bindings::krun_set_passt_fd;
+use crate::config::{KrunvmConfig, NetworkMode, VmConfig};
 use crate::utils::{mount_container, umount_container};
-use crate::{KrunvmConfig, VmConfig};
 
 #[derive(Args, Debug)]
 /// Start an existing microVM
@@ -34,6 +48,64 @@ pub struct StartCmd {
     /// Amount of RAM in MiB
     #[arg(long)]
     mem: Option<usize>, // TODO: implement or remove this
+}
+
+fn start_passt(mapped_ports: &HashMap<String, String>) -> Result<OwnedFd, ()> {
+    let path = format!(
+        "/tmp/krunvm-passt-{}.socket",
+        Alphanumeric.sample_string(&mut rand::thread_rng(), 32)
+    );
+
+    let mut cmd = std::process::Command::new("passt");
+    cmd.arg("-q").arg("-f").arg("-1").arg("-s").arg(&path);
+
+    if !mapped_ports.is_empty() {
+        let comma_separated_ports = mapped_ports
+            .iter()
+            .map(|(host_port, guest_port)| format!("{}:{}", host_port, guest_port))
+            .collect::<Vec<String>>()
+            .join(",");
+
+        cmd.arg("-t").arg(comma_separated_ports);
+    }
+
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+
+    // passt will fork itself and run in the background
+    match cmd.spawn() {
+        Ok(_child) => (),
+        Err(e) => {
+            eprintln!("Failed to start passt: {e}");
+            return Err(());
+        }
+    }
+
+    let sock_path = UnixAddr::new(path.as_str()).expect("Failed to create UnixAddr");
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .expect("Failed to create socket fd");
+
+    for _ in 0..500 {
+        match connect(fd.as_raw_fd(), &sock_path) {
+            Ok(()) => {
+                let _ = unlink(path.as_str());
+                return Ok(fd);
+            }
+            Err(Errno::ECONNREFUSED | Errno::ENOENT) => thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                eprintln!("Failed to connect to passt socket: {e}");
+                return Err(());
+            }
+        }
+    }
+    eprintln!("Timed out - can't connect to socket: {path}");
+    Err(())
 }
 
 impl StartCmd {
@@ -152,10 +224,29 @@ unsafe fn exec_vm(vmcfg: &VmConfig, rootfs: &str, cmd: Option<&str>, args: Vec<C
     }
     ps.push(std::ptr::null());
 
-    let ret = bindings::krun_set_port_map(ctx, ps.as_ptr());
-    if ret < 0 {
-        println!("Error setting VM port map");
-        std::process::exit(-1);
+    match vmcfg.network_mode {
+        NetworkMode::Tsi => {
+            let ret = bindings::krun_set_port_map(ctx, ps.as_ptr());
+            if ret < 0 {
+                println!("Error setting VM port map");
+                std::process::exit(-1);
+            }
+        }
+        NetworkMode::Passt => {
+            let Ok(passt_fd) = start_passt(&vmcfg.mapped_ports) else {
+                std::process::exit(-1);
+            };
+            let ret = krun_set_passt_fd(ctx, passt_fd.into_raw_fd() as c_int);
+            if ret < 0 {
+                let errno = Errno::from_i32(-ret);
+                if errno == Errno::ENOTSUP {
+                    println!("Failed to set passt fd: your libkrun build does not support virtio-net/passt mode.");
+                } else {
+                    println!("Failed to set passt fd: {}", errno);
+                }
+                std::process::exit(-1);
+            }
+        }
     }
 
     if !vmcfg.workdir.is_empty() {
